@@ -1,0 +1,8 @@
+fastapi
+uvicorn[standard]
+stripe
+python-dotenv
+pydantic
+google-generativeai
+httpx
+pinecone-client>=3.0.0

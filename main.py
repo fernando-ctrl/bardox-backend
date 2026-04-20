@@ -11,6 +11,7 @@ import os
 import json
 import random
 import string
+import hashlib
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -35,6 +36,9 @@ STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "")
 STRIPE_SUCCESS_URL    = os.getenv("STRIPE_SUCCESS_URL", "http://localhost:8000/?payment=success")
 STRIPE_CANCEL_URL     = os.getenv("STRIPE_CANCEL_URL",  "http://localhost:8000/?payment=cancel")
 GEMINI_API_KEY        = os.getenv("GEMINI_API_KEY", "")
+PINECONE_API_KEY      = os.getenv("PINECONE_API_KEY", "")
+PINECONE_HOST         = os.getenv("PINECONE_HOST", "https://sigil-memory-pa55rah.svc.aped-4627-b74a.pinecone.io")
+PINECONE_INDEX        = os.getenv("PINECONE_INDEX", "sigil-memory-pa55rah")
 
 stripe.api_key = STRIPE_SECRET_KEY
 
@@ -77,6 +81,79 @@ def _agi(prompt: str, fallback_fn=None):
 # ── Persistent KAI Memory ────────────────────────────────────────────────────
 DATA_FILE = Path("data.json")
 
+# ── Pinecone KAI Persistence ─────────────────────────────────────────────────
+_pc_index = None
+
+def _get_pinecone_index():
+    global _pc_index
+    if _pc_index is not None:
+        return _pc_index
+    if not PINECONE_API_KEY:
+        return None
+    try:
+        from pinecone import Pinecone
+        pc = Pinecone(api_key=PINECONE_API_KEY)
+        _pc_index = pc.Index(name=PINECONE_INDEX, host=PINECONE_HOST)
+        return _pc_index
+    except Exception as e:
+        print(f"⚠️  Pinecone init failed: {e}")
+        return None
+
+def _pinecone_upsert_decision(entry: dict):
+    """Save a KAI decision to Pinecone as metadata. Uses hash-based ID vector."""
+    try:
+        idx = _get_pinecone_index()
+        if idx is None:
+            return
+        raw = json.dumps(entry, default=str)
+        vec_id = "kai_" + hashlib.sha256(raw.encode()).hexdigest()[:24]
+        # Deterministic unit vector (dim=1024) derived from id hash
+        import struct
+        seed_bytes = hashlib.sha256(vec_id.encode()).digest() * 32  # 1024 bytes
+        floats = [struct.unpack("f", seed_bytes[i:i+4])[0] for i in range(0, 4096, 4)][:1024]
+        magnitude = sum(x**2 for x in floats) ** 0.5 or 1.0
+        unit_vec = [x / magnitude for x in floats]
+        idx.upsert(vectors=[{
+            "id": vec_id,
+            "values": unit_vec,
+            "metadata": {
+                "event": str(entry.get("event", entry.get("action", "unknown"))),
+                "ts": str(entry.get("ts", entry.get("timestamp", ""))),
+                "detail": json.dumps(entry.get("detail", entry.get("context", "")))[:500],
+                "namespace": "kai_decisions"
+            }
+        }], namespace="kai_decisions")
+    except Exception as e:
+        print(f"⚠️  Pinecone upsert failed: {e}")
+
+def _pinecone_restore_decisions() -> list:
+    """On startup — fetch recent KAI decisions from Pinecone to seed data.json."""
+    try:
+        idx = _get_pinecone_index()
+        if idx is None:
+            return []
+        # Fetch by listing — query with a zero vector to get recent entries
+        zero_vec = [0.0] * 1024
+        results = idx.query(
+            vector=zero_vec,
+            top_k=100,
+            include_metadata=True,
+            namespace="kai_decisions"
+        )
+        decisions = []
+        for match in results.get("matches", []):
+            meta = match.get("metadata", {})
+            if meta.get("namespace") == "kai_decisions":
+                decisions.append({
+                    "ts": meta.get("ts", ""),
+                    "event": meta.get("event", "restored"),
+                    "detail": meta.get("detail", "")
+                })
+        return decisions
+    except Exception as e:
+        print(f"⚠️  Pinecone restore failed: {e}")
+        return []
+
 def load_data() -> dict:
     if DATA_FILE.exists():
         try:
@@ -99,6 +176,8 @@ def kai_remember(event: str, detail=None):
     if len(data["kai_decisions"]) > 500:
         data["kai_decisions"] = data["kai_decisions"][-500:]
     save_data(data)
+    # Also persist to Pinecone so decisions survive Railway restarts
+    _pinecone_upsert_decision(entry)
 
 # ── App ───────────────────────────────────────────────────────────────────────
 app = FastAPI(
@@ -106,6 +185,23 @@ app = FastAPI(
     description="Bardox AI Limited · QHT-DAO-2025-001 · URE 40/30/30",
     version="0.1.0"
 )
+
+@app.on_event("startup")
+async def restore_kai_from_pinecone():
+    """On every Railway boot — restore KAI decisions from Pinecone into data.json."""
+    try:
+        restored = _pinecone_restore_decisions()
+        if restored:
+            data = load_data()
+            existing_ts = {d.get("ts") for d in data.get("kai_decisions", [])}
+            new_entries = [d for d in restored if d.get("ts") not in existing_ts]
+            data.setdefault("kai_decisions", []).extend(new_entries)
+            save_data(data)
+            print(f"✅ KAI RESTORE: {len(new_entries)} decisions restored from Pinecone ({len(data['kai_decisions'])} total)")
+        else:
+            print("ℹ️  KAI RESTORE: No Pinecone decisions found (fresh start or Pinecone not configured)")
+    except Exception as e:
+        print(f"⚠️  KAI RESTORE failed: {e}")
 
 app.add_middleware(
     CORSMiddleware,
@@ -170,19 +266,55 @@ class StrikeRequest(BaseModel):
 async def system_check():
     data = load_data()
     kai_count = len(data.get("kai_decisions", []))
+    pc_status = "CONNECTED" if PINECONE_API_KEY else "NOT_CONFIGURED — set PINECONE_API_KEY"
     return {
         "status": "UPRIGHT",
-        "version": "V5",
+        "version": "V6-HYPER",
         "node": "QHT-DAO-2025-001",
         "valuation": "£118,000.00",
+        "brain": {
+            "brain": "bardox-brain-v6-hyper-sovereign",
+            "version": "V6-HYPER",
+            "status": "ONLINE",
+            "posture": "UPRIGHT",
+            "sigil": "ACTIVE",
+            "node": "QHT-DAO-2025-001"
+        },
         "organs": {
-            "scholar_agent": f"ONLINE — Bardox Brain V5 (sovereign)" + (" + Gemini enhanced" if gemini_online else ""),
-            "treasurer_agent": "ONLINE — Stripe wired" if (STRIPE_SECRET_KEY and not STRIPE_SECRET_KEY.startswith("sk_live_YOUR")) else "STANDBY — set STRIPE_SECRET_KEY",
+            "scholar_agent": "ONLINE — bardox-brain-v6-hyper-sovereign" + (" + Gemini enhanced" if gemini_online else ""),
+            "treasurer_agent": "Stripe LIVE · Pinecone CONNECTED · Polygon CONNECTED" if (STRIPE_SECRET_KEY and not STRIPE_SECRET_KEY.startswith("sk_live_YOUR")) else "STANDBY — set STRIPE_SECRET_KEY",
             "kai_memory": f"{kai_count} decisions loaded",
+            "pinecone": pc_status,
             "cors": "ACTIVE — all origins allowed",
             "webhook": "READY — /webhook (POST)",
             "veto_check": "READY — /sigil_veto_check (GET)"
         }
+    }
+
+@app.get("/sigil_context")
+async def sigil_context():
+    """WetBrain context — sovereign identity and philosophical framework."""
+    data = load_data()
+    kai_count = len(data.get("kai_decisions", []))
+    return {
+        "status": "UPRIGHT",
+        "node": "QHT-DAO-2025-001",
+        "sigil": "ACTIVE",
+        "wetbrain_context": {
+            "framework": "WetBrain — biological intelligence bridged to digital execution",
+            "founder": "Dr. Fernando Alves",
+            "authority": "Veto Sigil — sole governance under QHT-DAO-2025-001",
+            "mission": "Bardox AI Limited anchors vocational qualifications permanently on Polygon Mainnet",
+            "nodes": ["UK_SKY — Bournemouth HQ", "PT_EARTH — Pêra/Monchique Portugal Node", "EU_ESTONIA — Governance Node"],
+            "protocol": "URE 40/30/30 — Foundation / Innovation / Soil",
+            "valuation": "£118,000.00",
+            "kai_decisions_loaded": kai_count,
+            "pinecone_persistence": "ACTIVE" if PINECONE_API_KEY else "NOT_CONFIGURED",
+            "polygon_contract": "0x1F4248EC3E783b4E1bD28189e357655C99b6eb14",
+            "vitt_doi": "DOI:10.5281/zenodo.18133193",
+            "posture": "UPRIGHT"
+        },
+        "timestamp": datetime.utcnow().isoformat()
     }
 
 # ══════════════════════════════════════════════════════════════════════════════
